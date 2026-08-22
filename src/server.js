@@ -12,6 +12,18 @@ import { detectConflicts } from "./conflictEngine.js";
 import { getTriageAdvice } from "./geminiTriage.js";
 import { buildDispatchComparison } from "./dispatchComparison.js";
 
+// ── Task 1: ESP32 Hardware Bridge (SerialPort) ──
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const { SerialPort } = require("serialport");
+const { ReadlineParser } = require("@serialport/parser-readline");
+
+// ── Task 2: Gemini LLM API ──
+const { GoogleGenAI } = require("@google/genai");
+const gemini = process.env.GEMINI_API_KEY
+  ? new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY })
+  : null;
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: "*" } });
@@ -44,6 +56,31 @@ function resolveTrainKey(rawId) {
     }
   }
   return rawId;
+}
+
+// ── ESP32 Serial Port Initialization ──
+// Wrapped in try/catch so the server stays alive if USB is unplugged.
+let espPort = null;
+try {
+  espPort = new SerialPort({ path: "/dev/cu.usbserial-0001", baudRate: 9600 });
+  const parser = espPort.pipe(new ReadlineParser({ delimiter: "\r\n" }));
+
+  parser.on("data", (data) => {
+    console.log(`[ESP32] Received: ${data}`);
+    io.emit("hardware_telemetry", { aspect: data });
+  });
+
+  espPort.on("error", (err) => {
+    console.warn(`[ESP32] Serial port error: ${err.message}`);
+  });
+
+  espPort.on("close", () => {
+    console.warn("[ESP32] Serial port closed. Hardware bridge offline.");
+  });
+
+  console.log("✅ ESP32 serial bridge connected on /dev/cu.usbserial-0001");
+} catch (err) {
+  console.warn(`⚠️  ESP32 serial port unavailable (${err.message}). Server continues without hardware bridge.`);
 }
 
 // Health Check
@@ -250,6 +287,57 @@ io.on("connection", (socket) => {
     activeStepIndex,
     stepNumber: activeStepIndex + 1,
     currentStep: SIMULATION_STEPS[activeStepIndex]
+  });
+
+  // ── Task 2: Gemini-powered Operator Command Resolution ──
+  socket.on("issue_operator_command", async (payload) => {
+    const { mismatchData } = payload ?? {};
+
+    if (!gemini) {
+      socket.emit("ai_resolution_ready", {
+        resolution_text: "Gemini API key not configured. Falling back to manual operator review.",
+        new_delay_mins: 0,
+      });
+      return;
+    }
+
+    const prompt = [
+      "You are RailGuard AI, a railway SLA resolution assistant.",
+      "Given the following SLA mismatch data, produce a resolution.",
+      "Return JSON matching the provided schema exactly.",
+      "",
+      `SLA_MISMATCH_DATA=${JSON.stringify(mismatchData)}`,
+    ].join("\n");
+
+    const resolutionSchema = {
+      type: "object",
+      properties: {
+        resolution_text: { type: "string" },
+        new_delay_mins: { type: "number" },
+      },
+      required: ["resolution_text", "new_delay_mins"],
+    };
+
+    try {
+      const response = await gemini.models.generateContent({
+        model: process.env.GEMINI_MODEL || "gemini-2.5-flash",
+        contents: prompt,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: resolutionSchema,
+          temperature: 0.2,
+        },
+      });
+
+      const result = JSON.parse(response.text);
+      socket.emit("ai_resolution_ready", result);
+    } catch (err) {
+      console.error("[Gemini] Operator command resolution failed:", err.message);
+      socket.emit("ai_resolution_ready", {
+        resolution_text: `AI resolution failed: ${err.message}. Manual review required.`,
+        new_delay_mins: 0,
+      });
+    }
   });
 });
 
